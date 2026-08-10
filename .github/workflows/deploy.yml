@@ -1,0 +1,81 @@
+name: Deploy to AWS Elastic Beanstalk
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Create source bundle
+        run: zip -r bundle.zip . -x node_modules/** .git/** .github/** bundle.zip
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload bundle to S3 and deploy to Elastic Beanstalk
+        run: |
+          APP_NAME="${{ secrets.EB_APP_NAME }}"
+          ENV_NAME="${{ secrets.EB_ENV_NAME }}"
+          S3_BUCKET="${{ secrets.S3_BUCKET }}"
+          VERSION_LABEL="deploy-$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+          S3_KEY="eb-deployments/${VERSION_LABEL}.zip"
+
+          echo "Uploading application bundle to s3://${S3_BUCKET}/${S3_KEY}"
+          aws s3 cp bundle.zip s3://${S3_BUCKET}/${S3_KEY}
+
+          echo "Creating application version ${VERSION_LABEL}"
+          aws elasticbeanstalk create-application-version \
+            --application-name "$APP_NAME" \
+            --version-label "$VERSION_LABEL" \
+            --source-bundle S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
+            --auto-create-application
+
+          EXISTING_ENV=$(aws elasticbeanstalk describe-environments \
+            --application-name "$APP_NAME" \
+            --environment-names "$ENV_NAME" \
+            --no-include-deleted \
+            --query 'Environments | length(@)' \
+            --output text)
+
+          if [ "$EXISTING_ENV" -eq 0 ]; then
+            echo "Creating Elastic Beanstalk environment $ENV_NAME"
+            OPTION_SETTINGS=()
+            if [ -n "${{ secrets.EXTERNAL_SERVICE }}" ]; then
+              OPTION_SETTINGS+=(Namespace=aws:elasticbeanstalk:application:environment,OptionName=EXTERNAL_SERVICE,Value="${{ secrets.EXTERNAL_SERVICE }}")
+            fi
+            if [ -n "${{ secrets.S3_BUCKET_NAME }}" ]; then
+              OPTION_SETTINGS+=(Namespace=aws:elasticbeanstalk:application:environment,OptionName=S3_BUCKET_NAME,Value="${{ secrets.S3_BUCKET_NAME }}")
+            fi
+
+            aws elasticbeanstalk create-environment \
+              --application-name "$APP_NAME" \
+              --environment-name "$ENV_NAME" \
+              --solution-stack-name "64bit Amazon Linux 2 v5.9.10 running Node.js 18" \
+              --version-label "$VERSION_LABEL" \
+              --option-settings "${OPTION_SETTINGS[@]}"
+          else
+            echo "Updating Elastic Beanstalk environment $ENV_NAME to version $VERSION_LABEL"
+            aws elasticbeanstalk update-environment \
+              --environment-name "$ENV_NAME" \
+              --version-label "$VERSION_LABEL"
+          fi
+        shell: bash
