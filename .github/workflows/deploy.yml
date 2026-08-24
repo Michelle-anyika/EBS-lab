@@ -5,6 +5,14 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: eb-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -18,29 +26,29 @@ jobs:
         with:
           node-version: 18
 
-      - name: Install dependencies
-        run: npm install
-
       - name: Create source bundle
         run: zip -r bundle.zip . -x node_modules/** .git/** .github/** bundle.zip
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Upload bundle to S3 and deploy to Elastic Beanstalk
         run: |
+          set -euo pipefail
+
           APP_NAME="${{ secrets.EB_APP_NAME }}"
           ENV_NAME="${{ secrets.EB_ENV_NAME }}"
           S3_BUCKET="${{ secrets.S3_BUCKET }}"
+          EXTERNAL_SERVICE_VALUE="${{ secrets.EXTERNAL_SERVICE }}"
+          S3_BUCKET_NAME_VALUE="${{ secrets.S3_BUCKET_NAME }}"
           VERSION_LABEL="deploy-$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
           S3_KEY="eb-deployments/${VERSION_LABEL}.zip"
 
           echo "Uploading application bundle to s3://${S3_BUCKET}/${S3_KEY}"
-          aws s3 cp bundle.zip s3://${S3_BUCKET}/${S3_KEY}
+          aws s3 cp bundle.zip "s3://${S3_BUCKET}/${S3_KEY}"
 
           echo "Creating application version ${VERSION_LABEL}"
           aws elasticbeanstalk create-application-version \
@@ -48,6 +56,14 @@ jobs:
             --version-label "$VERSION_LABEL" \
             --source-bundle S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
             --auto-create-application
+
+          # Environment variables are always driven from secrets here (never
+          # from a value baked into the source bundle), so there is exactly
+          # one source of truth and every deploy keeps them in sync.
+          OPTION_SETTINGS=(
+            Namespace=aws:elasticbeanstalk:application:environment,OptionName=EXTERNAL_SERVICE,Value="${EXTERNAL_SERVICE_VALUE}"
+            Namespace=aws:elasticbeanstalk:application:environment,OptionName=S3_BUCKET_NAME,Value="${S3_BUCKET_NAME_VALUE}"
+          )
 
           EXISTING_ENV=$(aws elasticbeanstalk describe-environments \
             --application-name "$APP_NAME" \
@@ -57,25 +73,47 @@ jobs:
             --output text)
 
           if [ "$EXISTING_ENV" -eq 0 ]; then
-            echo "Creating Elastic Beanstalk environment $ENV_NAME"
-            OPTION_SETTINGS=()
-            if [ -n "${{ secrets.EXTERNAL_SERVICE }}" ]; then
-              OPTION_SETTINGS+=(Namespace=aws:elasticbeanstalk:application:environment,OptionName=EXTERNAL_SERVICE,Value="${{ secrets.EXTERNAL_SERVICE }}")
+            echo "Resolving latest available Node.js 18 solution stack"
+            SOLUTION_STACK=$(aws elasticbeanstalk list-available-solution-stacks \
+              --query "SolutionStacks[?contains(@, 'running Node.js 18')] | [0]" \
+              --output text)
+            if [ -z "$SOLUTION_STACK" ] || [ "$SOLUTION_STACK" == "None" ]; then
+              echo "::error::No available Elastic Beanstalk solution stack found for Node.js 18"
+              exit 1
             fi
-            if [ -n "${{ secrets.S3_BUCKET_NAME }}" ]; then
-              OPTION_SETTINGS+=(Namespace=aws:elasticbeanstalk:application:environment,OptionName=S3_BUCKET_NAME,Value="${{ secrets.S3_BUCKET_NAME }}")
-            fi
+            echo "Using solution stack: ${SOLUTION_STACK}"
 
+            echo "Creating Elastic Beanstalk environment $ENV_NAME"
             aws elasticbeanstalk create-environment \
               --application-name "$APP_NAME" \
               --environment-name "$ENV_NAME" \
-              --solution-stack-name "64bit Amazon Linux 2 v5.9.10 running Node.js 18" \
+              --solution-stack-name "$SOLUTION_STACK" \
               --version-label "$VERSION_LABEL" \
-              --option-settings "${OPTION_SETTINGS[@]}"
+              --option-settings "${OPTION_SETTINGS[@]}" \
+                Namespace=aws:elasticbeanstalk:environment,OptionName=ServiceRole,Value=aws-elasticbeanstalk-service-role
           else
             echo "Updating Elastic Beanstalk environment $ENV_NAME to version $VERSION_LABEL"
             aws elasticbeanstalk update-environment \
               --environment-name "$ENV_NAME" \
-              --version-label "$VERSION_LABEL"
+              --version-label "$VERSION_LABEL" \
+              --option-settings "${OPTION_SETTINGS[@]}"
+          fi
+
+          echo "Waiting for environment to finish updating..."
+          aws elasticbeanstalk wait environment-updated --environment-name "$ENV_NAME"
+
+          HEALTH=$(aws elasticbeanstalk describe-environment-health \
+            --environment-name "$ENV_NAME" \
+            --attribute-names Status HealthStatus \
+            --query 'HealthStatus' --output text)
+          STATUS=$(aws elasticbeanstalk describe-environment-health \
+            --environment-name "$ENV_NAME" \
+            --attribute-names Status \
+            --query 'Status' --output text)
+
+          echo "Environment status: ${STATUS}, health: ${HEALTH}"
+          if [ "$STATUS" != "Ready" ] || { [ "$HEALTH" != "Ok" ] && [ "$HEALTH" != "Info" ]; }; then
+            echo "::error::Deployment finished but environment is not healthy (status=${STATUS}, health=${HEALTH})"
+            exit 1
           fi
         shell: bash
