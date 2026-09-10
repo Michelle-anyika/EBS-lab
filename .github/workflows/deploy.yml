@@ -111,9 +111,23 @@ jobs:
             --attribute-names Status \
             --query 'Status' --output text)
 
-          echo "Environment status: ${STATUS}, health: ${HEALTH}"
+          DEPLOYED_VERSION=$(aws elasticbeanstalk describe-environments \
+            --environment-names "$ENV_NAME" \
+            --query 'Environments[0].VersionLabel' --output text)
+
+          echo "Environment status: ${STATUS}, health: ${HEALTH}, version: ${DEPLOYED_VERSION}"
+
+          # "wait environment-updated" only waits for the environment to leave
+          # Updating/Launching state - it returns just as successfully after a
+          # failed deploy that rolled back to the old version. Checking status/
+          # health alone would report success even though nothing new shipped,
+          # so the version label is checked explicitly too.
           if [ "$STATUS" != "Ready" ] || { [ "$HEALTH" != "Ok" ] && [ "$HEALTH" != "Info" ]; }; then
             echo "::error::Deployment finished but environment is not healthy (status=${STATUS}, health=${HEALTH})"
+            exit 1
+          fi
+          if [ "$DEPLOYED_VERSION" != "$VERSION_LABEL" ]; then
+            echo "::error::Environment is healthy but running version '${DEPLOYED_VERSION}', expected '${VERSION_LABEL}' - deployment did not actually apply (likely rolled back)"
             exit 1
           fi
         shell: bash
