@@ -130,4 +130,50 @@ jobs:
             echo "::error::Environment is healthy but running version '${DEPLOYED_VERSION}', expected '${VERSION_LABEL}' - deployment did not actually apply (likely rolled back)"
             exit 1
           fi
+
+          # The environment's very first (console-created) configuration
+          # explicitly recorded the default aws-elasticbeanstalk-ec2-role as
+          # IamInstanceProfile. An explicitly-recorded environment option
+          # takes precedence over the .ebextensions option_settings value on
+          # every later deploy, so the Ref-based override in
+          # iam-instance-role.config is silently ignored unless this option
+          # is also set directly here. The profile's name is CloudFormation-
+          # generated (kept nameless to avoid requiring CAPABILITY_NAMED_IAM,
+          # which Elastic Beanstalk's environment update does not grant), so
+          # it has to be resolved from the stack after each deploy rather
+          # than hardcoded.
+          ENV_ID=$(aws elasticbeanstalk describe-environments \
+            --environment-names "$ENV_NAME" \
+            --query 'Environments[0].EnvironmentId' --output text)
+          STACK_NAME="awseb-${ENV_ID}-stack"
+          INSTANCE_PROFILE_NAME=$(aws cloudformation describe-stack-resources \
+            --stack-name "$STACK_NAME" \
+            --logical-resource-id ExternalServiceInstanceProfile \
+            --query 'StackResources[0].PhysicalResourceId' --output text 2>/dev/null || true)
+
+          CURRENT_INSTANCE_PROFILE=$(aws elasticbeanstalk describe-configuration-settings \
+            --application-name "$APP_NAME" --environment-name "$ENV_NAME" \
+            --query "ConfigurationSettings[0].OptionSettings[?Namespace=='aws:autoscaling:launchconfiguration' && OptionName=='IamInstanceProfile'].Value | [0]" \
+            --output text)
+
+          if [ -n "$INSTANCE_PROFILE_NAME" ] && [ "$INSTANCE_PROFILE_NAME" != "None" ] && [ "$INSTANCE_PROFILE_NAME" != "$CURRENT_INSTANCE_PROFILE" ]; then
+            echo "Correcting IamInstanceProfile: '${CURRENT_INSTANCE_PROFILE}' -> '${INSTANCE_PROFILE_NAME}'"
+            aws elasticbeanstalk update-environment \
+              --environment-name "$ENV_NAME" \
+              --option-settings Namespace=aws:autoscaling:launchconfiguration,OptionName=IamInstanceProfile,Value="$INSTANCE_PROFILE_NAME"
+
+            aws elasticbeanstalk wait environment-updated --environment-name "$ENV_NAME"
+
+            HEALTH=$(aws elasticbeanstalk describe-environment-health \
+              --environment-name "$ENV_NAME" --attribute-names HealthStatus --query 'HealthStatus' --output text)
+            STATUS=$(aws elasticbeanstalk describe-environment-health \
+              --environment-name "$ENV_NAME" --attribute-names Status --query 'Status' --output text)
+            echo "Post-instance-profile-fix status: ${STATUS}, health: ${HEALTH}"
+            if [ "$STATUS" != "Ready" ] || { [ "$HEALTH" != "Ok" ] && [ "$HEALTH" != "Info" ]; }; then
+              echo "::error::Environment is not healthy after correcting IamInstanceProfile (status=${STATUS}, health=${HEALTH})"
+              exit 1
+            fi
+          else
+            echo "IamInstanceProfile already correct (${CURRENT_INSTANCE_PROFILE}), no follow-up update needed"
+          fi
         shell: bash
